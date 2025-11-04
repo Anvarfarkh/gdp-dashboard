@@ -59,7 +59,7 @@ with st.sidebar:
             thicknesses.append(
                 st.number_input(f"Thickness L{i+1} (m)", min_value=0.1, value=float(default_thk[i]), step=0.1)
             )
-    if len(thicknesses):
+if len(thicknesses):
     thicknesses = np.r_[thicknesses]
 else:
     thicknesses = np.array([])
