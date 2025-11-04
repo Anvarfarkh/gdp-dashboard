@@ -1,151 +1,171 @@
-import streamlit as st
+import numpy as np
 import pandas as pd
-import math
-from pathlib import Path
+import matplotlib.pyplot as plt
+import streamlit as st
 
-# Set the title and favicon that appear in the Browser's tab bar.
-st.set_page_config(
-    page_title='GDP dashboard',
-    page_icon=':earth_americas:', # This is an emoji shortcode. Could be a URL too.
+from simpeg.electromagnetics.static import resistivity as dc
+from simpeg import maps
+
+st.set_page_config(page_title="1D DC Forward (SimPEG)", page_icon="🪪", layout="wide")
+st.title("1D DC Resistivity — Forward Modelling (SimPEG)")
+st.markdown(
+    "Configure a layered Earth and electrode geometry, then compute the **apparent resistivity** curve. "
+    "Uses `simpeg.electromagnetics.static.resistivity.simulation_1d.Simulation1DLayers`."
 )
 
-# -----------------------------------------------------------------------------
-# Declare some useful functions.
+# ---------- SIDEBAR: Survey setup ----------
+with st.sidebar:
+    st.header("Geometry")
 
-@st.cache_data
-def get_gdp_data():
-    """Grab GDP data from a CSV file.
-
-    This uses caching to avoid having to read the file every time. If we were
-    reading from an HTTP endpoint instead of a file, it's a good idea to set
-    a maximum age to the cache with the TTL argument: @st.cache_data(ttl='1d')
-    """
-
-    # Instead of a CSV on disk, you could read from an HTTP endpoint here too.
-    DATA_FILENAME = Path(__file__).parent/'data/gdp_data.csv'
-    raw_gdp_df = pd.read_csv(DATA_FILENAME)
-
-    MIN_YEAR = 1960
-    MAX_YEAR = 2022
-
-    # The data above has columns like:
-    # - Country Name
-    # - Country Code
-    # - [Stuff I don't care about]
-    # - GDP for 1960
-    # - GDP for 1961
-    # - GDP for 1962
-    # - ...
-    # - GDP for 2022
-    #
-    # ...but I want this instead:
-    # - Country Name
-    # - Country Code
-    # - Year
-    # - GDP
-    #
-    # So let's pivot all those year-columns into two: Year and GDP
-    gdp_df = raw_gdp_df.melt(
-        ['Country Code'],
-        [str(x) for x in range(MIN_YEAR, MAX_YEAR + 1)],
-        'Year',
-        'GDP',
+    array_type = st.radio(
+        "Array type", ["Schlumberger", "Wenner"], index=0, help="Wenner: MN/2 = AB/6. Schlumberger: set MN/2 ratio."
     )
 
-    # Convert years from string to integers
-    gdp_df['Year'] = pd.to_numeric(gdp_df['Year'])
+    colA1, colA2 = st.columns(2)
+    with colA1:
+        ab2_min = st.number_input("AB/2 min (m)", min_value=0.1, value=5.0, step=0.1, format="%.2f")
+    with colA2:
+        ab2_max = st.number_input("AB/2 max (m)", min_value=ab2_min + 0.1, value=300.0, step=1.0, format="%.2f")
 
-    return gdp_df
+    n_stations = st.slider("Number of stations", min_value=8, max_value=60, value=25, step=1)
 
-gdp_df = get_gdp_data()
+    if array_type == "Schlumberger":
+        mn2_ratio = st.slider(
+            "MN/2 as fraction of AB/2",
+            min_value=0.02, max_value=0.49, value=0.10, step=0.01,
+            help="MN/2 = ratio × AB/2. Must be < 0.5."
+        )
+    else:
+        mn2_ratio = 1.0/3.0  # Wenner: MN/2 = AB/6 → ratio = (AB/6)/(AB/2) = 1/3
 
-# -----------------------------------------------------------------------------
-# Draw the actual page
+    st.divider()
+    st.header("Layers")
 
-# Set the title that appears at the top of the page.
-'''
-# :earth_americas: GDP dashboard
+    n_layers = st.slider("Number of layers", 3, 5, 4, help="Total layers (half-space is the last layer).")
+    # Default models
+    default_rho = [10.0, 30.0, 15.0, 50.0, 100.0][:n_layers]
+    default_thk = [2.0, 8.0, 60.0, 120.0][:max(0, n_layers-1)]
 
-Browse GDP data from the [World Bank Open Data](https://data.worldbank.org/) website. As you'll
-notice, the data only goes to 2022 right now, and datapoints for certain years are often missing.
-But it's otherwise a great (and did I mention _free_?) source of data.
-'''
+    layer_rhos = []
+    for i in range(n_layers):
+        layer_rhos.append(
+            st.number_input(f"ρ Layer {i+1} (Ω·m)", min_value=0.1, value=float(default_rho[i]), step=0.1)
+        )
 
-# Add some spacing
-''
-''
+    thicknesses = []
+    if n_layers > 1:
+        st.caption("Thicknesses for the **upper** N−1 layers (last layer is half-space):")
+        for i in range(n_layers - 1):
+            thicknesses.append(
+                st.number_input(f"Thickness L{i+1} (m)", min_value=0.1, value=float(default_thk[i]), step=0.1)
+            )
+    thicknesses = np.r_[thicknesses] if len(thicknesses) else np.r_[]
 
-min_value = gdp_df['Year'].min()
-max_value = gdp_df['Year'].max()
+st.divider()
 
-from_year, to_year = st.slider(
-    'Which years are you interested in?',
-    min_value=min_value,
-    max_value=max_value,
-    value=[min_value, max_value])
+# ---------- Build survey ----------
+# AB/2 spaced geometrically
+AB2 = np.geomspace(ab2_min, ab2_max, n_stations)
+# MN/2 from ratio; ensure MN/2 < AB/2
+MN2 = np.minimum(mn2_ratio * AB2, 0.49 * AB2)
+eps = 1e-6  # avoid exact coincidence M=A, N=B
 
-countries = gdp_df['Country Code'].unique()
+src_list = []
+for L, a in zip(AB2, MN2):
+    # A,B at ±AB/2; M,N at ±MN/2 (nudged by eps)
+    A = np.r_[-L, 0.0, 0.0]
+    B = np.r_[ +L, 0.0, 0.0]
+    M = np.r_[ -(a - eps), 0.0, 0.0]
+    N = np.r_[ +(a - eps), 0.0, 0.0]
+    rx = dc.receivers.Dipole(M, N, data_type="apparent_resistivity")
+    src = dc.sources.Dipole([rx], A, B)
+    src_list.append(src)
 
-if not len(countries):
-    st.warning("Select at least one country")
+survey = dc.Survey(src_list)
 
-selected_countries = st.multiselect(
-    'Which countries would you like to view?',
-    countries,
-    ['DEU', 'FRA', 'GBR', 'BRA', 'MEX', 'JPN'])
+# ---------- Simulation + forward ----------
+rho = np.r_[layer_rhos]
+rho_map = maps.IdentityMap(nP=len(rho))
 
-''
-''
-''
-
-# Filter the data
-filtered_gdp_df = gdp_df[
-    (gdp_df['Country Code'].isin(selected_countries))
-    & (gdp_df['Year'] <= to_year)
-    & (from_year <= gdp_df['Year'])
-]
-
-st.header('GDP over time', divider='gray')
-
-''
-
-st.line_chart(
-    filtered_gdp_df,
-    x='Year',
-    y='GDP',
-    color='Country Code',
+sim = dc.simulation_1d.Simulation1DLayers(
+    survey=survey, rhoMap=rho_map, thicknesses=thicknesses
 )
 
-''
-''
+# Compute dpred (apparent resistivity)
+try:
+    rho_app = sim.dpred(rho)
+    ok = True
+except Exception as e:
+    ok = False
+    st.error(f"Forward modelling failed: {e}")
 
+# ---------- Layout ----------
+col1, col2 = st.columns([2, 1])
 
-first_year = gdp_df[gdp_df['Year'] == from_year]
-last_year = gdp_df[gdp_df['Year'] == to_year]
+with col1:
+    st.subheader("Sounding curve (log–log)")
+    if ok:
+        fig, ax = plt.subplots(figsize=(7, 5))
+        ax.loglog(AB2, rho_app, "o-", label="ρₐ (predicted)")
+        ax.grid(True, which="both", ls=":")
+        ax.set_xlabel("AB/2 (m)")
+        ax.set_ylabel("Apparent resistivity (Ω·m)")
+        ax.set_title(f"{array_type} VES (forward)")
+        # Optional fixed ticks — comment out if you prefer auto:
+        # ax.set_xlim(1, 1000)
+        # ax.set_ylim(0.5, 1e4)
+        st.pyplot(fig, clear_figure=True)
 
-st.header(f'GDP in {to_year}', divider='gray')
-
-''
-
-cols = st.columns(4)
-
-for i, country in enumerate(selected_countries):
-    col = cols[i % len(cols)]
-
-    with col:
-        first_gdp = first_year[first_year['Country Code'] == country]['GDP'].iat[0] / 1000000000
-        last_gdp = last_year[last_year['Country Code'] == country]['GDP'].iat[0] / 1000000000
-
-        if math.isnan(first_gdp):
-            growth = 'n/a'
-            delta_color = 'off'
-        else:
-            growth = f'{last_gdp / first_gdp:,.2f}x'
-            delta_color = 'normal'
-
-        st.metric(
-            label=f'{country} GDP',
-            value=f'{last_gdp:,.0f}B',
-            delta=growth,
-            delta_color=delta_color
+        # Download CSV
+        df_out = pd.DataFrame({
+            "AB/2 (m)": AB2,
+            "MN/2 (m)": MN2,
+            "Apparent resistivity (ohm·m)": rho_app,
+        })
+        st.download_button(
+            "Download synthetic data (CSV)",
+            data=df_out.to_csv(index=False).encode("utf-8"),
+            file_name="synthetic_VES.csv",
+            mime="text/csv",
         )
+
+with col2:
+    st.subheader("Layered model")
+    if ok:
+        # Quick “block” plot for layers
+        fig2, ax2 = plt.subplots(figsize=(4, 5))
+        rho_vals = rho
+        # Build depth boundaries
+        if len(thicknesses):
+            interfaces = np.r_[0.0, np.cumsum(thicknesses)]
+        else:
+            interfaces = np.r_[0.0]
+        # Add a bottom depth for plotting last layer
+        z_bottom = interfaces[-1] + max(interfaces[-1]*0.3, 10.0)
+        tops = np.r_[interfaces, interfaces[-1]]          # N values
+        bottoms = np.r_[interfaces[1:], z_bottom]         # N values
+
+        for i in range(n_layers):
+            ax2.fill_betweenx([tops[i], bottoms[i]], 0, rho_vals[i], alpha=0.35)
+            ax2.text(rho_vals[i]*1.05, (tops[i]+bottoms[i])/2, f"{rho_vals[i]:.1f} Ω·m", va="center", fontsize=9)
+        ax2.invert_yaxis()
+        ax2.set_xlabel("Resistivity (Ω·m)")
+        ax2.set_ylabel("Depth (m)")
+        ax2.grid(True, ls=":")
+        ax2.set_title("Block model")
+        st.pyplot(fig2, clear_figure=True)
+
+    # Also display a tidy table of the model
+    model_df = pd.DataFrame({
+        "Layer": np.arange(1, n_layers+1),
+        "Resistivity (Ω·m)": rho,
+        "Thickness (m)": [*thicknesses, np.nan],
+        "Note": [""]*(n_layers-1) + ["Half-space"]
+    })
+    st.dataframe(model_df, use_container_width=True)
+
+st.caption(
+    "Notes: (1) Schlumberger uses your MN/2 ratio; Wenner fixes MN/2 = AB/6. "
+    "(2) A tiny epsilon is subtracted so M≠A and N≠B to avoid singularities. "
+    "(3) If you hit numerical issues at extreme geometries, reduce AB/2 range or adjust MN/2."
+)
